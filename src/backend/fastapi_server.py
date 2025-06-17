@@ -13,9 +13,11 @@ import shutil
 import uvicorn
 from spellchecker import SpellChecker
 import base64
-
+import subprocess
+from gtts import gTTS
+import azure.cognitiveservices.speech as speechsdk
 #integrating Gemini live 2.0 flash for voice assistant
-from google import genai
+#import google.generativeai as genai
 from fastapi import FastAPI, UploadFile, HTTPException
 import soundfile as sf
 import numpy as np
@@ -23,7 +25,12 @@ import librosa
 import base64
 import io
 import asyncio
-client = genai.Client(api_key="GEMINI_API_KEY")
+import ffmpeg
+import soundfile as sf
+import google.genai as genai
+from google.genai import types
+#genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 # Import your existing RAG system
 # Make sure enhanced_rag_app.py is in the same directory
@@ -35,7 +42,17 @@ app = FastAPI(
     description="API for Biology Research Assistant with RAG capabilities",
     version="1.0.0"
 )
+import re
 
+def strip_markdown(text: str) -> str:
+    # Remove Markdown bold/italic/code formatting
+    text = re.sub(r'(\*\*|\*|__|_|`|~~|=)', '', text)
+    # Remove Markdown images/links
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    # Remove headers, blockquotes, lists, etc.
+    text = re.sub(r'^\s{0,3}([#>\-\*\+]+)\s*', '', text, flags=re.MULTILINE)
+    return text.strip()
 
 # Add CORS middleware
 app.add_middleware(
@@ -285,69 +302,93 @@ async def list_uploaded_files():
 
 #voice query
 @app.post("/api/voice-query")
-async def voice_query(audio: UploadFile):
+async def voice_query(audio: UploadFile = File(...)):
+    import traceback 
+    
     print("Voice query processing")
+    temp_in_path = temp_out_path = tts_fp_name = None
     try:
-        # 1. Validate and convert audio to required format
+        # 1. Save uploaded audio to temp file
         audio_bytes = await audio.read()
-        y, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000, mono=True)
-        y = y.reshape(-1, 1) 
-        buffer = io.BytesIO()
-        sf.write(buffer, y, sr, format='WAV', subtype='PCM_16')
-        buffer.seek(0)
-        pcm_audio = buffer.getvalue()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_in:
+            temp_in.write(audio_bytes)
+            temp_in_path = temp_in.name
 
-        # 2. Configure Live API session
-        config = {
-            "input_modalities": ["AUDIO"],
-            "response_modalities": ["TEXT", "AUDIO"],
-            "enable_fallback": True,
-            "system_instruction": "You are a biology research assistant."
+        # 2. Convert to WAV using FFmpeg
+        temp_out_path = temp_in_path + ".wav"
+        subprocess.run([
+            "ffmpeg", "-y", "-i", temp_in_path,
+            "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le", temp_out_path
+        ], check=True, capture_output=True)
+
+        # 3. Send audio to Gemini 2.0 Flash for transcription
+        with open(temp_out_path, "rb") as f:
+            audio_bytes_wav = f.read()
+        audio_part = types.Part.from_bytes(
+            data=audio_bytes_wav,
+            mime_type="audio/wav"
+        )
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                "Transcribe this audio.",
+                audio_part
+            ]
+        )
+        transcript = response.text
+
+        # 4. Query your RAG app
+        rag_result = rag_app.query(transcript)
+        answer = rag_result["answer"]
+        cleaned_answer = strip_markdown(answer)
+        # 5. Generate TTS audio for the answer (gTTS)
+
+        speech_key = "25tMEu66CWzcH66kFZdYIIE4lG2XroqtqpEhLAmTuOzbYJ6QJXftJQQJ99BFACGhslBXJ3w3AAAYACOGdNH6"
+        region = "centralindia"  # e.g., "centralindia"
+        voice_name = "en-IN-NeerjaNeural"  # Or another Indian voice 
+        speech_config = speechsdk.SpeechConfig(subscription=speech_key, region=region)
+        speech_config.speech_synthesis_voice_name = voice_name
+        speech_config.set_speech_synthesis_output_format(
+            speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3
+        )
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+        result = synthesizer.speak_text_async(cleaned_answer).get()
+        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            answer_audio = result.audio_data  # MP3 bytes
+            answer_audio_b64 = base64.b64encode(answer_audio).decode("utf-8")
+        else:
+            raise RuntimeError(f"Speech synthesis failed: {result.reason}")
+
+        # 6. Cleanup temp files (after all file handles are closed)
+        if temp_in_path and os.path.exists(temp_in_path):
+            os.unlink(temp_in_path)
+        if temp_out_path and os.path.exists(temp_out_path):
+            os.unlink(temp_out_path)
+        if tts_fp_name and os.path.exists(tts_fp_name):
+            os.unlink(tts_fp_name)
+
+        return {
+            "question": transcript,
+            "answer": answer,
+            "audio": answer_audio_b64
         }
 
-        # 3. Create Live API session
-        async with genai.aio.live.connect(
-            model="gemini-2.0-flash-live-001",
-            config=config
-        ) as session:
-            
-            # 4. Send audio input
-            await session.send_realtime_input(
-                audio=genai.types.Blob(
-                    data=pcm_audio,
-                    mime_type="audio/pcm;rate=16000"
-                )
-            )
-
-            # 5. Process responses
-            response_audio = bytearray()
-            question = ""
-            answer = ""
-            
-            async for response in session.receive():
-                # Transcription logic
-                if response.server_content and response.server_content.text:
-                    question = response.server_content.text
-                
-                # Answer extraction
-                if response.server_content and response.server_content.model_turn:
-                    answer = response.server_content.model_turn.text
-                
-                # Audio collection
-                if response.data:
-                    response_audio.extend(response.data)
-
-            # 6. Return formatted response
-            return {
-                "question": question,
-                "answer": answer,
-                "audio": base64.b64encode(bytes(response_audio)).decode("utf-8")
-            }
-
+    except subprocess.CalledProcessError as e:
+        print(f"FFmpeg error: {e.stderr.decode()}")
+        traceback.print_exc()
+        raise HTTPException(500, "Audio conversion failed")
     except Exception as e:
-        print(f"🔴 Error: {str(e)}")
-        raise HTTPException(500, f"Voice processing failed: {str(e)}")
-    
+        print(f"Error: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(500, f"Processing failed: {str(e)}")
+    finally:
+        # Extra safety: clean up temp files if any remain
+        for path in [temp_in_path, temp_out_path, tts_fp_name]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
 if __name__ == "__main__":
     print("🚀 Starting Biology RAG Assistant API Server...")
     print("📝 Make sure you have:")
@@ -363,4 +404,4 @@ if __name__ == "__main__":
         port=8000,
         reload=True,
         log_level="info"
-    )
+    ) 

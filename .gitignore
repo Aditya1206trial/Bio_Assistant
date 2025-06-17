@@ -1,0 +1,6 @@
+# Ignore node_modules cache and Python cache
+node_modules/
+__pycache__/
+*.pyc
+*.sqlite3
+*.bin

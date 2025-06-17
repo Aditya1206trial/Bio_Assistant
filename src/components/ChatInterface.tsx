@@ -13,6 +13,9 @@ interface Message {
   audio?: string;
 }
 
+// Module-level variable to track the currently playing audio
+let currentAudio: HTMLAudioElement | null = null;
+
 export const ChatInterface = () => {
   const [isThinking, setIsThinking] = useState(false);
   const [messages, setMessages] = useState<Message[]>(() => {
@@ -42,12 +45,10 @@ export const ChatInterface = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { toast } = useToast();
 
-  // Scroll to bottom when messages change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Persist messages to sessionStorage
   useEffect(() => {
     sessionStorage.setItem("biology-chat-messages", JSON.stringify(messages));
   }, [messages]);
@@ -130,10 +131,14 @@ export const ChatInterface = () => {
         audio,
       }
     ]);
-    // Optionally auto-play the audio
+    // Optionally auto-play the audio, using the single-audio logic
     if (audio) {
-      const audioObj = new Audio(`data:audio/webm;base64,${audio}`);
-      audioObj.play();
+      if (currentAudio) {
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+      }
+      currentAudio = new Audio(`data:audio/mp3;base64,${audio}`);
+      currentAudio.play();
     }
   };
 
@@ -188,8 +193,12 @@ export const ChatInterface = () => {
                       <button
                         className="mt-2 text-xs text-blue-600 hover:underline"
                         onClick={() => {
-                          const audio = new Audio(`data:audio/webm;base64,${message.audio}`);
-                          audio.play();
+                          if (currentAudio) {
+                            currentAudio.pause();
+                            currentAudio.currentTime = 0;
+                          }
+                          currentAudio = new Audio(`data:audio/mp3;base64,${message.audio}`);
+                          currentAudio.play();
                         }}
                       >
                         ▶️ Play Response
